@@ -3,10 +3,13 @@ declare(strict_types=1);
 namespace Amyx\Anvil;
 
 use Amyx\Anvil\network\AnvilRequestExecutor;
+use Amyx\Anvil\network\BookPreview;
 use Amyx\Anvil\compat\Bootstrap;
 use pocketmine\block\inventory\AnvilInventory;
 use pocketmine\event\Listener;
 use pocketmine\event\inventory\InventoryOpenEvent;
+use pocketmine\event\inventory\InventoryCloseEvent;
+use pocketmine\event\player\PlayerQuitEvent;
 use pocketmine\event\server\DataPacketReceiveEvent;
 use pocketmine\inventory\transaction\TransactionException;
 use pocketmine\inventory\transaction\action\SlotChangeAction;
@@ -18,18 +21,27 @@ use pocketmine\network\mcpe\protocol\ItemStackResponsePacket;
 use pocketmine\network\mcpe\protocol\types\inventory\stackresponse\ItemStackResponse;
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\ItemStackRequest;
 use pocketmine\plugin\PluginBase;
+use pocketmine\scheduler\ClosureTask;
 
 final class Main extends PluginBase implements Listener{
     private int $lastRejectionLog=0;
+    private BookPreview $bookPreview;
     protected function onLoad(): void{ Bootstrap::register(); }
     protected function onEnable(): void{
+        $this->bookPreview=new BookPreview();
         $this->getServer()->getPluginManager()->registerEvents($this,$this);
+        $this->getScheduler()->scheduleRepeatingTask(new ClosureTask(function(): void{
+            $this->bookPreview->tick($this->getServer()->getOnlinePlayers());
+        }),5);
         $this->getLogger()->info('Нативная наковальня включена: имена, ремонт, чары и опыт.');
     }
 
     public function onOpen(InventoryOpenEvent $event): void{
         if($event->getInventory() instanceof AnvilInventory && !$event->getPlayer()->hasPermission('amyxanvil.use')){ $event->cancel(); }
     }
+
+    public function onClose(InventoryCloseEvent $event): void{ $this->bookPreview->forget($event->getPlayer()); }
+    public function onQuit(PlayerQuitEvent $event): void{ $this->bookPreview->forget($event->getPlayer()); }
 
     /** @priority HIGHEST */
     public function onPacket(DataPacketReceiveEvent $event): void{
@@ -65,9 +77,9 @@ final class Main extends PluginBase implements Listener{
                 // On old PM5 this method is the only response builder; it remains available on newer PM5.
                 $response=static fn()=>$executor->buildItemStackResponse();
             }catch(ItemStackRequestProcessException|TransactionException|PacketHandlingException $e){
-                $this->recordRejection($request,$e,$window);$manager->requestSyncAll();
+                $this->recordRejection($request,$e,$window);$this->bookPreview->invalidate($player);$manager->requestSyncAll();
             }catch(\Throwable $e){
-                $this->getLogger()->logException($e);$manager->requestSyncAll();
+                $this->getLogger()->logException($e);$this->bookPreview->invalidate($player);$manager->requestSyncAll();
             }finally{
                 $manager->syncMismatchedPredictedSlotChanges();$manager->setCurrentItemStackRequestId(null);
             }

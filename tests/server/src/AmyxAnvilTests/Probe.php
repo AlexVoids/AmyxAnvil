@@ -237,6 +237,46 @@ final class Probe extends PluginBase{
                 [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(2));$r=$this->request($p,$w,null,2);$a=$r->getActions();$a[0]=new Recipe(0,0);
                 self::ok($this->send($p,new ItemStackRequest(-1,$a,[],0))===ItemStackResponse::RESULT_OK);self::ok($p->getInventory()->getItem(0)->getDamage()===0);self::ok($p->getXpManager()->getXpLevel()===28);
             });
+            $this->test('book result is sent to the client before any pickup without consuming inputs',function(): void{
+                $map=EnchantmentIdMap::getInstance();$protection=$map->fromId(0);$unbreaking=$map->fromId(17);
+                [$p,$w]=$this->fixture(Bootstrap::book()->addEnchantment(new EnchantmentInstance($protection,4)),Bootstrap::book()->addEnchantment(new EnchantmentInstance($unbreaking,3)));
+                $preview=new \Amyx\Anvil\network\BookPreview();$before=count($p->getNetworkSession()->sent);$preview->refresh($p);
+                self::ok(count($p->getNetworkSession()->sent)===$before+1,'No server preview packet');
+                $packet=end($p->getNetworkSession()->sent);self::ok($packet instanceof \pocketmine\network\mcpe\protocol\InventorySlotPacket && $packet->windowId===\pocketmine\network\mcpe\protocol\types\inventory\ContainerIds::UI && $packet->inventorySlot===50);
+                $decoded=self::roundTrip($packet);$book=$p->getNetworkSession()->getTypeConverter()->netItemStackToCore($decoded->item->getItemStack());
+                self::ok($book->getEnchantmentLevel($protection)===4 && $book->getEnchantmentLevel($unbreaking)===3 && $book->getCount()===1);
+                self::ok(!$w->isSlotEmpty(0) && !$w->isSlotEmpty(1) && $p->getXpManager()->getXpLevel()===30 && $p->getInventory()->getContents()===[] && $p->getCursorInventory()->isSlotEmpty(0));
+                $preview->refresh($p);self::ok(count($p->getNetworkSession()->sent)===$before+1,'Unchanged preview was sent repeatedly');
+                self::ok($this->send($p,$this->request($p,$w,null,1))===ItemStackResponse::RESULT_OK);
+                self::ok($p->getInventory()->getItem(0)->equalsExact($book) && $p->getXpManager()->getXpLevel()===27 && $w->isSlotEmpty(0) && $w->isSlotEmpty(1));
+                $preview->refresh($p);$packet=end($p->getNetworkSession()->sent);self::ok($packet->inventorySlot===50 && $packet->item->getItemStack()->getId()===0,'Collected preview was not cleared');
+            });
+            $this->test('incompatible books clear a previously visible server preview',function(): void{
+                $map=EnchantmentIdMap::getInstance();[$p,$w]=$this->fixture(Bootstrap::book()->addEnchantment(new EnchantmentInstance($map->fromId(0),4)),Bootstrap::book()->addEnchantment(new EnchantmentInstance($map->fromId(17),3)));
+                $preview=new \Amyx\Anvil\network\BookPreview();$preview->refresh($p);
+                $w->setItem(1,Bootstrap::book()->addEnchantment(new EnchantmentInstance($map->fromId(1),4)));$preview->refresh($p);
+                $packet=end($p->getNetworkSession()->sent);self::ok($packet->inventorySlot===50 && $packet->item->getItemStack()->getId()===0);
+                self::ok($w->getItem(0)->getEnchantmentLevel($map->fromId(0))===4 && $w->getItem(1)->getEnchantmentLevel($map->fromId(1))===4 && $p->getXpManager()->getXpLevel()===30);
+            });
+            $this->test('closing an anvil does not overwrite another windows result with a stale preview',function(): void{
+                $map=EnchantmentIdMap::getInstance();[$p,$w]=$this->fixture(Bootstrap::book()->addEnchantment(new EnchantmentInstance($map->fromId(0),4)),Bootstrap::book()->addEnchantment(new EnchantmentInstance($map->fromId(17),3)));
+                $preview=new \Amyx\Anvil\network\BookPreview();$preview->refresh($p);$p->removeCurrentWindow();$before=count($p->getNetworkSession()->sent);$preview->refresh($p);
+                self::ok(count($p->getNetworkSession()->sent)===$before && $p->getXpManager()->getXpLevel()===30);
+            });
+            $this->test('three books merge sequentially through native inventory requests',function(): void{
+                $map=EnchantmentIdMap::getInstance();$protection=$map->fromId(0);$unbreaking=$map->fromId(17);$mending=$map->fromId(26);
+                [$p,$w]=$this->fixture(Bootstrap::book()->addEnchantment(new EnchantmentInstance($protection,4)),Bootstrap::book()->addEnchantment(new EnchantmentInstance($unbreaking,3)));
+                self::ok($this->send($p,$this->request($p,$w,null,1))===ItemStackResponse::RESULT_OK);
+                $p->getInventory()->setItem(1,Bootstrap::book()->addEnchantment(new EnchantmentInstance($mending,1)));
+                $m=$p->getNetworkSession()->getInvManager();
+                $actions=[new Place(1,self::slot(C::INVENTORY,0,$m->getItemStackInfo($p->getInventory(),0)->getStackId()),self::slot(C::ANVIL_INPUT,1,0)),new Place(1,self::slot(C::INVENTORY,1,$m->getItemStackInfo($p->getInventory(),1)->getStackId()),self::slot(C::ANVIL_MATERIAL,2,0))];
+                $request=new ItemStackRequest(-2,$actions,[],0);$executor=new \pocketmine\network\mcpe\handler\ItemStackRequestExecutor($p,$m,$request);$transaction=$executor->generateInventoryTransaction();
+                $m->setCurrentItemStackRequestId(-2);$m->addTransactionPredictedSlotChanges($transaction);$transaction->execute();$m->syncMismatchedPredictedSlotChanges();$m->setCurrentItemStackRequestId(null);
+                $request=$this->request($p,$w,null,1);$request=new ItemStackRequest(-3,$request->getActions(),[],0);
+                self::ok($this->send($p,$request)===ItemStackResponse::RESULT_OK);
+                $book=$p->getInventory()->getItem(0);self::ok(count($book->getEnchantments())===3 && $book->getEnchantmentLevel($protection)===4 && $book->getEnchantmentLevel($unbreaking)===3 && $book->getEnchantmentLevel($mending)===1);
+                self::ok($w->isSlotEmpty(0) && $w->isSlotEmpty(1) && $p->getXpManager()->getXpLevel()===24);
+            });
             $this->test('native enchanted-book fusion changes NBT and costs two levels',function(): void{
                 $type=EnchantmentIdMap::getInstance()->fromId(26);[$p,$w]=$this->fixture(I::DIAMOND_SWORD(),Bootstrap::book()->addEnchantment(new EnchantmentInstance($type,1)));
                 self::ok($this->send($p,$this->request($p,$w,null,1))===ItemStackResponse::RESULT_OK);self::ok($p->getInventory()->getItem(0)->getEnchantmentLevel($type)===1);self::ok($p->getXpManager()->getXpLevel()===28);

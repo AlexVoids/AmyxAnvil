@@ -79,6 +79,15 @@ nameTest('two books merge and serialize newly registered vanilla identities',fun
     $p=$calc->calculate(book()->addEnchantment(ench(14,2)),book()->addEnchantment(ench(14,2)),null);eq(3,$p->result()->getEnchantmentLevel(ench(14)->getType()));eq(2,$p->levels);
     $round=\pocketmine\item\Item::nbtDeserialize($p->result()->nbtSerialize());eq(3,$round->getEnchantmentLevel(ench(14)->getType()));
 });
+nameTest('three different books combine into one and can be applied to armour',function() use($calc): void{
+    $left=book()->addEnchantment(ench(0,4))->setLore(['Сохранить']);
+    $first=$calc->calculate($left,book()->addEnchantment(ench(17,3)),null);eq(3,$first->levels);
+    $second=$calc->calculate($first->result(),book()->addEnchantment(ench(26)),null);eq(3,$second->levels);
+    $combined=\pocketmine\item\Item::nbtDeserialize($second->result()->nbtSerialize());
+    eq('enchanted_book',AnvilCalculator::identifier($combined));eq(1,$combined->getCount());eq(3,count($combined->getEnchantments()));eq(['Сохранить'],$combined->getLore());
+    $armour=$calc->calculate(I::NETHERITE_CHESTPLATE(),$combined,null)->result();
+    foreach([0=>4,17=>3,26=>1] as $id=>$level){eq($level,$combined->getEnchantmentLevel(ench($id)->getType()));eq($level,$armour->getEnchantmentLevel(ench($id)->getType()));}
+});
 nameTest('prior-work penalty grows as 1, 3, 7 and is inherited from both inputs',function() use($calc): void{
     $p=$calc->calculate(work(I::IRON_SWORD()->setDamage(100),3),work(I::IRON_INGOT(),7),null);eq(11,$p->levels);eq(15,$p->result()->getNamedTag()->getInt('RepairCost'));
 });
