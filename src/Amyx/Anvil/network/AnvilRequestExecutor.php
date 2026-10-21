@@ -36,7 +36,8 @@ use pocketmine\player\Player;
 final class AnvilRequestExecutor extends ItemStackRequestExecutor{
     private AnvilPlan $plan;
     private array $consumed=[0=>0,1=>0];
-    private bool $started=false;
+    private bool $generationStarted=false;
+    private int $remainingOutput=0;
     /** @var ItemStackRequestSlotInfo[] Virtual result slots actually used by this request. */
     private array $previewSlots=[];
     /** @var array<int,array<int,array{Inventory,Item,Item}>> Initial/final slot snapshots. */
@@ -88,7 +89,11 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
         if(self::isOutputSlot($slotInfo)){
             // Native anvil results use this preview container as well as CREATED_OUTPUT.
             // Both draw from the SAME server-calculated, finite result stack.
-            $item=$this->takeCreatedItem($count);
+            if($count<1 || $count>$this->remainingOutput){
+                throw new ItemStackRequestProcessException('Invalid anvil output count: available '.$this->remainingOutput.', requested '.$count);
+            }
+            $item=$this->plan->result()->setCount($count);
+            $this->remainingOutput-=$count;
             if(self::container($slotInfo)===ContainerUIIds::ANVIL_RESULT_PREVIEW){ $this->previewSlots[$slotInfo->getSlotId()]=$slotInfo; }
             return $item;
         }
@@ -131,10 +136,8 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
 
     protected function processItemStackRequestAction(ItemStackRequestAction $action): void{
         if($action instanceof CraftRecipeOptionalStackRequestAction || $action instanceof DeprecatedCraftingNonImplementedStackRequestAction){
-            if(!$this->started){ $this->started=true;$this->setNextCreatedItem($this->plan->result()); }
-            return;
+            return; // The server plan and the finite output are initialized exactly once per request.
         }
-        if(!$this->started){ throw new ItemStackRequestProcessException('Anvil recipe must precede inventory changes'); }
         if($action instanceof CraftingConsumeInputStackRequestAction){
             [$inventory,$slot]=$this->getBuilderInventoryAndSlot($action->getSource());
             if($inventory->getActualInventory()!==$this->anvil || !array_key_exists($slot,$this->consumed)){
@@ -160,7 +163,9 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
             }
             [$target]=$this->getBuilderInventoryAndSlot($action->getDestination());
             $this->assertPlayerInventory($target->getActualInventory());
-            parent::processItemStackRequestAction($action);
+            $count=$action->getCount();
+            $removed=$this->removeItemFromSlot($action->getSource(),$count);
+            $this->addItemToSlot($action->getDestination(),$removed,$count);
             return;
         }
         throw new ItemStackRequestProcessException('Unsupported action in anvil transaction');
@@ -189,6 +194,9 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
 
     // The non-null return also matches early PM5 where the parent return was not nullable.
     public function generateInventoryTransaction(): InventoryTransaction{
+        if($this->generationStarted){ throw new ItemStackRequestProcessException('Anvil request was already generated'); }
+        $this->generationStarted=true;
+        $this->remainingOutput=$this->plan->result()->getCount();
         // A station recipe creates a server-owned result. Consume actions are
         // optional protocol acknowledgements on some clients. Fill in ONLY absent
         // input containers; explicitly provided counts/IDs still receive validation.
@@ -202,12 +210,21 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
                 $explicit[$slot]=true;
             }
         }
-        $this->started=true;
-        $this->setNextCreatedItem($this->plan->result());
         if(!$explicit[0]){ $this->consumeImplicitInput(0,$this->plan->input()->getCount()); }
         if(!$explicit[1]){ $this->consumeImplicitInput(1,$this->plan->materialCount); }
-        parent::generateInventoryTransaction(); // dispatch actions and require the entire finite result to be taken
-        if(!$this->started || $this->consumed[0]!==$this->plan->input()->getCount() || $this->consumed[1]!==$this->plan->materialCount){
+        // Do not use core's crafting output buffer or recipe dispatcher. NG and
+        // upstream kernels have different anvil/crafting internals. This request
+        // owns one finite server-calculated output and one atomic transaction.
+        foreach($this->anvilRequest->getActions() as $index=>$action){
+            try{ $this->processItemStackRequestAction($action); }
+            catch(ItemStackRequestProcessException $e){
+                throw new ItemStackRequestProcessException('Anvil action '.$index.' ('.(new \ReflectionClass($action))->getShortName().'): '.$e->getMessage(),0,$e);
+            }
+        }
+        if($this->remainingOutput!==0){
+            throw new ItemStackRequestProcessException('Incomplete anvil output: '.$this->remainingOutput.' items were not taken');
+        }
+        if($this->consumed[0]!==$this->plan->input()->getCount() || $this->consumed[1]!==$this->plan->materialCount){
             throw new ItemStackRequestProcessException('Incomplete anvil transaction');
         }
         $actions=[];

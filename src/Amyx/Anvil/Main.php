@@ -65,7 +65,7 @@ final class Main extends PluginBase implements Listener{
                 // On old PM5 this method is the only response builder; it remains available on newer PM5.
                 $response=static fn()=>$executor->buildItemStackResponse();
             }catch(ItemStackRequestProcessException|TransactionException|PacketHandlingException $e){
-                $this->recordRejection($request,$e);$manager->requestSyncAll();
+                $this->recordRejection($request,$e,$window);$manager->requestSyncAll();
             }catch(\Throwable $e){
                 $this->getLogger()->logException($e);$manager->requestSyncAll();
             }finally{
@@ -87,7 +87,7 @@ final class Main extends PluginBase implements Listener{
         }
     }
 
-    private function recordRejection(ItemStackRequest $request,\Throwable $error): void{
+    private function recordRejection(ItemStackRequest $request,\Throwable $error,AnvilInventory $anvil): void{
         $this->getLogger()->debug('Anvil request rejected: '.$error->getMessage());
         if(!AnvilRequestExecutor::isAnvilRequest($request) || time()-$this->lastRejectionLog<5){ return; }
         $this->lastRejectionLog=time();$actions=[];
@@ -108,7 +108,18 @@ final class Main extends PluginBase implements Listener{
         clearstatcache(true,$path);
         if(is_file($path) && filesize($path)>262144 && !@rename($path,$path.'.old')){ @file_put_contents($path,''); }
         // No player names, rename strings or client item NBT are recorded.
-        @file_put_contents($path,json_encode(['time'=>gmdate('c'),'plugin'=>$this->getDescription()->getVersion(),'server'=>$this->getServer()->getVersion(),'request'=>$request->getRequestId(),'error'=>$error->getMessage(),'actions'=>$actions],JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL,FILE_APPEND|LOCK_EX);
+        $inputs=[];
+        foreach([0,1] as $slot){
+            $item=$anvil->getItem($slot);
+            $inputs[]=['type'=>$item->getTypeId(),'count'=>$item->getCount(),'enchantmentCount'=>count($item->getEnchantments())];
+        }
+        @file_put_contents($path,json_encode([
+            'time'=>gmdate('c'),'plugin'=>$this->getDescription()->getVersion(),
+            'server'=>$this->getServer()->getVersion(),'engine'=>$this->getServer()->getName(),
+            'engineVersion'=>$this->getServer()->getPocketMineVersion(),'api'=>$this->getServer()->getApiVersion(),
+            'request'=>$request->getRequestId(),'error'=>$error->getMessage(),
+            'errorAt'=>basename($error->getFile()).':'.$error->getLine(),'inputs'=>$inputs,'actions'=>$actions
+        ],JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL,FILE_APPEND|LOCK_EX);
         $this->getLogger()->warning('Наковальня отклонила запрос: '.$error->getMessage().'. Подробности: plugins/AmyxAnvil/anvil-errors.log');
     }
 }

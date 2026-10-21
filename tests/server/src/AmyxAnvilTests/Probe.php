@@ -135,6 +135,17 @@ final class Probe extends PluginBase{
                 $request=new ItemStackRequest(-1,[new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::INVENTORY,0,0))],[],0);
                 self::ok($this->send($p,$request)===ItemStackResponse::RESULT_OK);self::ok($w->isSlotEmpty(0) && $w->getItem(1)->getCount()===6);self::ok($p->getInventory()->getItem(0)->getDamage()===0 && $p->getXpManager()->getXpLevel()===28);
             });
+            foreach([-155=>8,-179=>8,-203=>7] as $requestId=>$destination){
+                $this->test('reported book request '.$requestId.' material first and combined inventory destination',function() use($requestId,$destination): void{
+                    $type=EnchantmentIdMap::getInstance()->fromId(0);
+                    [$p,$w]=$this->fixture(I::NETHERITE_CHESTPLATE(),Bootstrap::book()->addEnchantment(new EnchantmentInstance($type,1)));
+                    $m=$p->getNetworkSession()->getInvManager();
+                    $actions=[new Recipe(0,0),new Consume(1,self::slot(1,2,$m->getItemStackInfo($w,1)->getStackId())),new Consume(1,self::slot(0,1,$m->getItemStackInfo($w,0)->getStackId())),new Place(1,self::slot(60,50,$requestId),self::slot(12,$destination,0))];
+                    $packet=self::roundTrip(ItemStackRequestPacket::create([new ItemStackRequest($requestId,$actions,[],0)]));
+                    self::ok($this->send($p,$packet->getRequests()[0])===ItemStackResponse::RESULT_OK,'Exact reported action sequence rejected');
+                    self::ok($w->isSlotEmpty(0) && $w->isSlotEmpty(1));self::ok($p->getInventory()->getItem($destination)->getEnchantmentLevel($type)===1);self::ok($p->getXpManager()->getXpLevel()===29);
+                });
+            }
             $this->test('book enchants reach client as complete serialized NBT and stack ID remains usable',function(): void{
                 $mending=EnchantmentIdMap::getInstance()->fromId(26);$unbreaking=EnchantmentIdMap::getInstance()->fromId(17);
                 $book=Bootstrap::book()->addEnchantment(new EnchantmentInstance($mending,1))->addEnchantment(new EnchantmentInstance($unbreaking,3));
@@ -263,6 +274,10 @@ final class Probe extends PluginBase{
             });
             $this->test('replaying a successful request cannot duplicate its result',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND());$request=$this->request($p,$w,'Once');self::ok($this->send($p,$request)===ItemStackResponse::RESULT_OK);self::ok($this->send($p,$request)===ItemStackResponse::RESULT_ERROR);self::ok($p->getInventory()->getItem(0)->getCount()===1);self::ok($p->getXpManager()->getXpLevel()===29);
+            });
+            $this->test('partial output cannot consume or destroy the remainder of a renamed stack',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND()->setCount(64));$request=$this->request($p,$w,'Partial',0,1,false,64);
+                self::ok($this->send($p,$request)===ItemStackResponse::RESULT_ERROR);self::ok($w->getItem(0)->getCount()===64 && $p->getInventory()->isSlotEmpty(0) && $p->getXpManager()->getXpLevel()===30);
             });
             $this->test('explicit partial stack consumption cannot yield a complete renamed stack',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND()->setCount(64));$request=$this->request($p,$w,'Half',0,64,false,32);
