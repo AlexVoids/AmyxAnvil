@@ -8,11 +8,15 @@ use Amyx\Anvil\rules\AnvilPlan;
 use Amyx\Anvil\transaction\AnvilTransaction;
 use pocketmine\block\inventory\AnvilInventory;
 use pocketmine\inventory\transaction\InventoryTransaction;
+use pocketmine\inventory\Inventory;
+use pocketmine\inventory\transaction\action\SlotChangeAction;
+use pocketmine\item\Durable;
 use pocketmine\item\Item;
 use pocketmine\network\mcpe\InventoryManager;
 use pocketmine\network\mcpe\handler\ItemStackRequestExecutor;
 use pocketmine\network\mcpe\handler\ItemStackRequestProcessException;
 use pocketmine\network\mcpe\protocol\types\inventory\ContainerUIIds;
+use pocketmine\network\mcpe\protocol\types\inventory\FullContainerName;
 use pocketmine\network\mcpe\protocol\types\inventory\UIInventorySlotOffset;
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\CraftRecipeOptionalStackRequestAction;
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\CraftingConsumeInputStackRequestAction;
@@ -35,8 +39,12 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
     private bool $started=false;
     /** @var ItemStackRequestSlotInfo[] Virtual result slots actually used by this request. */
     private array $previewSlots=[];
+    /** @var array<int,array<int,array{Inventory,Item,Item}>> Initial/final slot snapshots. */
+    private array $slotChanges=[];
+    /** @var array<int,array<int,array{ItemStackRequestSlotInfo,Inventory,int}>> */
+    private array $responseSlots=[];
 
-    public function __construct(private Player $actor,InventoryManager $manager,private ItemStackRequest $anvilRequest,private AnvilInventory $anvil){
+    public function __construct(private Player $actor,private InventoryManager $manager,private ItemStackRequest $anvilRequest,private AnvilInventory $anvil){
         parent::__construct($actor,$manager,$anvilRequest);
         $optional=null;
         foreach($anvilRequest->getActions() as $action){
@@ -61,6 +69,7 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
     public static function isAnvilRequest(ItemStackRequest $request): bool{
         foreach($request->getActions() as $action){
             if($action instanceof CraftRecipeOptionalStackRequestAction || $action instanceof DeprecatedCraftingNonImplementedStackRequestAction){ return true; }
+            if(($action instanceof TakeStackRequestAction || $action instanceof PlaceStackRequestAction) && self::isOutputSlot($action->getSource())){ return true; }
         }
         return false;
     }
@@ -76,14 +85,48 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
     }
 
     protected function removeItemFromSlot(ItemStackRequestSlotInfo $slotInfo,int $count): Item{
-        if(self::container($slotInfo)===ContainerUIIds::ANVIL_RESULT_PREVIEW && self::isOutputSlot($slotInfo)){
+        if(self::isOutputSlot($slotInfo)){
             // Native anvil results use this preview container as well as CREATED_OUTPUT.
             // Both draw from the SAME server-calculated, finite result stack.
             $item=$this->takeCreatedItem($count);
-            $this->previewSlots[$slotInfo->getSlotId()]=$slotInfo;
+            if(self::container($slotInfo)===ContainerUIIds::ANVIL_RESULT_PREVIEW){ $this->previewSlots[$slotInfo->getSlotId()]=$slotInfo; }
             return $item;
         }
-        return parent::removeItemFromSlot($slotInfo,$count);
+        [$inventory,$slot]=$this->resolveSlot($slotInfo);
+        $item=$this->readSlot($inventory,$slot);
+        if($count<1 || $count>$item->getCount()){ throw new ItemStackRequestProcessException('Invalid source count'); }
+        $removed=$item->pop($count);
+        $this->writeSlot($inventory,$slot,$item);
+        return $removed;
+    }
+
+    protected function addItemToSlot(ItemStackRequestSlotInfo $slotInfo,Item $item,int $count): void{
+        [$inventory,$slot]=$this->resolveSlot($slotInfo);
+        $existing=$this->readSlot($inventory,$slot);
+        if($count<1 || (!$existing->isNull() && !$existing->canStackWith($item))){ throw new ItemStackRequestProcessException('Invalid destination item'); }
+        $total=$existing->getCount()+$count;
+        if($total>min($item->getMaxStackSize(),$inventory->getMaxStackSize())){ throw new ItemStackRequestProcessException('Destination stack is full'); }
+        $this->writeSlot($inventory,$slot,(clone $item)->setCount($total));
+    }
+
+    private function resolveSlot(ItemStackRequestSlotInfo $info): array{
+        // Retain core's container/window/slot and stack-network-ID validation.
+        [$builder,$slot]=$this->getBuilderInventoryAndSlot($info);
+        $inventory=$builder->getActualInventory();
+        $this->responseSlots[self::container($info)][$info->getSlotId()]=[$info,$inventory,$slot];
+        return [$inventory,$slot];
+    }
+
+    private function readSlot(Inventory $inventory,int $slot): Item{
+        return clone ($this->slotChanges[spl_object_id($inventory)][$slot][2] ?? $inventory->getItem($slot));
+    }
+
+    private function writeSlot(Inventory $inventory,int $slot,Item $item): void{
+        $id=spl_object_id($inventory);
+        $initial=$this->slotChanges[$id][$slot][1] ?? $inventory->getItem($slot);
+        // Unlike some PM5 TransactionBuilderInventory versions, a transition back
+        // to the original item (notably AIR -> result -> AIR) MUST reset the diff.
+        $this->slotChanges[$id][$slot]=[$inventory,$initial,clone $item];
     }
 
     protected function processItemStackRequestAction(ItemStackRequestAction $action): void{
@@ -110,30 +153,89 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
         if($action instanceof DeprecatedCraftingResultsStackRequestAction){ return; } // Client output is deliberately unused.
         if($action instanceof TakeStackRequestAction || $action instanceof PlaceStackRequestAction){
             if(!self::isOutputSlot($action->getSource())){
-                throw new ItemStackRequestProcessException('Only the calculated output may be transferred');
+                // Bedrock can move the result to the cursor, then to an inventory slot
+                // in ONE request. The second leg is an ordinary, stack-ID checked move.
+                [$source]=$this->getBuilderInventoryAndSlot($action->getSource());
+                $this->assertPlayerInventory($source->getActualInventory());
             }
             [$target]=$this->getBuilderInventoryAndSlot($action->getDestination());
-            if($target->getActualInventory()!==$this->actor->getInventory() && $target->getActualInventory()!==$this->actor->getCursorInventory()){
-                throw new ItemStackRequestProcessException('Invalid output destination');
-            }
+            $this->assertPlayerInventory($target->getActualInventory());
             parent::processItemStackRequestAction($action);
             return;
         }
         throw new ItemStackRequestProcessException('Unsupported action in anvil transaction');
     }
 
+    private function assertPlayerInventory(Inventory $inventory): void{
+        if($inventory!==$this->actor->getInventory() && $inventory!==$this->actor->getCursorInventory()){
+            throw new ItemStackRequestProcessException('Invalid output transfer inventory');
+        }
+    }
+
+    private function consumeImplicitInput(int $slot,int $count): void{
+        if($count===0){ return; }
+        $offset=UIInventorySlotOffset::ANVIL;
+        $networkSlot=is_array($offset) ? array_search($slot,$offset,true) : $offset+$slot;
+        if($networkSlot===false){ throw new ItemStackRequestProcessException('Unknown anvil input mapping'); }
+        $container=$slot===0 ? ContainerUIIds::ANVIL_INPUT : ContainerUIIds::ANVIL_MATERIAL;
+        $info=$this->manager->getItemStackInfo($this->anvil,$slot);
+        if($info===null){ throw new ItemStackRequestProcessException('Untracked anvil input'); }
+        $source=new ItemStackRequestSlotInfo(class_exists(FullContainerName::class) ? new FullContainerName($container) : $container,$networkSlot,$info->getStackId());
+        // Stage the deduction without editing the live inventory. Include these
+        // input slots in the response even if the client omitted Consume.
+        $this->removeItemFromSlot($source,$count);
+        $this->consumed[$slot]=$count;
+    }
+
     // The non-null return also matches early PM5 where the parent return was not nullable.
     public function generateInventoryTransaction(): InventoryTransaction{
-        $transaction=parent::generateInventoryTransaction();
-        if($transaction===null || !$this->started || $this->consumed[0]!==$this->plan->input()->getCount() || $this->consumed[1]!==$this->plan->materialCount){
+        // A station recipe creates a server-owned result. Consume actions are
+        // optional protocol acknowledgements on some clients. Fill in ONLY absent
+        // input containers; explicitly provided counts/IDs still receive validation.
+        $explicit=[0=>false,1=>false];
+        foreach($this->anvilRequest->getActions() as $action){
+            if($action instanceof CraftingConsumeInputStackRequestAction){
+                [$inventory,$slot]=$this->getBuilderInventoryAndSlot($action->getSource());
+                if($inventory->getActualInventory()!==$this->anvil || !array_key_exists($slot,$explicit)){
+                    throw new ItemStackRequestProcessException('Only anvil inputs may be consumed');
+                }
+                $explicit[$slot]=true;
+            }
+        }
+        $this->started=true;
+        $this->setNextCreatedItem($this->plan->result());
+        if(!$explicit[0]){ $this->consumeImplicitInput(0,$this->plan->input()->getCount()); }
+        if(!$explicit[1]){ $this->consumeImplicitInput(1,$this->plan->materialCount); }
+        parent::generateInventoryTransaction(); // dispatch actions and require the entire finite result to be taken
+        if(!$this->started || $this->consumed[0]!==$this->plan->input()->getCount() || $this->consumed[1]!==$this->plan->materialCount){
             throw new ItemStackRequestProcessException('Incomplete anvil transaction');
         }
-        return new AnvilTransaction($this->actor,$this->anvil,$this->plan,$transaction->getActions());
+        $actions=[];
+        foreach($this->slotChanges as $slots){
+            foreach($slots as $slot=>[$inventory,$initial,$final]){
+                if(!$initial->equalsExact($final)){ $actions[]=new SlotChangeAction($inventory,$slot,$initial,$final); }
+            }
+        }
+        return new AnvilTransaction($this->actor,$this->anvil,$this->plan,$actions);
     }
 
     public function buildItemStackResponse(): ItemStackResponse{
-        $response=parent::buildItemStackResponse();
-        if($this->previewSlots===[]){ return $response; }
+        $containers=[];
+        foreach($this->responseSlots as $infos){
+            $slots=[];
+            foreach($infos as [$info,$inventory,$slot]){
+                $stack=$this->manager->getItemStackInfo($inventory,$slot);
+                if($stack===null){ continue; } // e.g. the anvil broke and core closed the inventory
+                $item=$inventory->getItem($slot);$id=$info->getSlotId();$name=$item->getCustomName();$damage=$item instanceof Durable ? $item->getDamage() : 0;
+                $slots[]=method_exists(ItemStackResponseSlotInfo::class,'getFilteredCustomName')
+                    ? new ItemStackResponseSlotInfo($id,$id,$item->getCount(),$stack->getStackId(),$name,$name,$damage)
+                    : new ItemStackResponseSlotInfo($id,$id,$item->getCount(),$stack->getStackId(),$name,$damage);
+            }
+            if($slots!==[]){
+                $info=reset($infos)[0];
+                $containers[]=new ItemStackResponseContainerInfo(method_exists($info,'getContainerName') ? $info->getContainerName() : $info->getContainerId(),$slots);
+            }
+        }
         // Acknowledge clearing the virtual preview as well as the real input/destination slots.
         // Core's response builder cannot resolve ANVIL_RESULT_PREVIEW to a real inventory.
         $slots=[];
@@ -143,10 +245,11 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
                 ? new ItemStackResponseSlotInfo($id,$id,0,0,'','',0)
                 : new ItemStackResponseSlotInfo($id,$id,0,0,'',0);
         }
-        $slot=reset($this->previewSlots);
-        $container=method_exists($slot,'getContainerName') ? $slot->getContainerName() : $slot->getContainerId();
-        $containers=$response->getContainerInfos();
-        $containers[]=new ItemStackResponseContainerInfo($container,$slots);
-        return new ItemStackResponse($response->getResult(),$response->getRequestId(),$containers);
+        if($slots!==[]){
+            $slot=reset($this->previewSlots);
+            $container=method_exists($slot,'getContainerName') ? $slot->getContainerName() : $slot->getContainerId();
+            $containers[]=new ItemStackResponseContainerInfo($container,$slots);
+        }
+        return new ItemStackResponse(ItemStackResponse::RESULT_OK,$this->anvilRequest->getRequestId(),$containers);
     }
 }

@@ -1,6 +1,6 @@
 name: AmyxAnvil
 main: Amyx\Anvil\Main
-version: 1.0.2
+version: 1.0.3
 api: 5.0.0
 load: STARTUP
 author: AlexVoids

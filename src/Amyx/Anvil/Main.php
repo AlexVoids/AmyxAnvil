@@ -9,15 +9,18 @@ use pocketmine\event\Listener;
 use pocketmine\event\inventory\InventoryOpenEvent;
 use pocketmine\event\server\DataPacketReceiveEvent;
 use pocketmine\inventory\transaction\TransactionException;
+use pocketmine\inventory\transaction\action\SlotChangeAction;
 use pocketmine\network\PacketHandlingException;
 use pocketmine\network\mcpe\handler\ItemStackRequestExecutor;
 use pocketmine\network\mcpe\handler\ItemStackRequestProcessException;
 use pocketmine\network\mcpe\protocol\ItemStackRequestPacket;
 use pocketmine\network\mcpe\protocol\ItemStackResponsePacket;
 use pocketmine\network\mcpe\protocol\types\inventory\stackresponse\ItemStackResponse;
+use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\ItemStackRequest;
 use pocketmine\plugin\PluginBase;
 
 final class Main extends PluginBase implements Listener{
+    private int $lastRejectionLog=0;
     protected function onLoad(): void{ Bootstrap::register(); }
     protected function onEnable(): void{
         $this->getServer()->getPluginManager()->registerEvents($this,$this);
@@ -37,7 +40,7 @@ final class Main extends PluginBase implements Listener{
         $hasAnvil=false;
         foreach($packet->getRequests() as $request){ if(AnvilRequestExecutor::isAnvilRequest($request)){ $hasAnvil=true;break; } }
         if(!$hasAnvil){ return; }
-        $event->cancel();$responses=[];
+        $event->cancel();$responses=[];$changedSlots=[];
         if(count($packet->getRequests())>80){ $manager->requestSyncAll();return; }
         foreach($packet->getRequests() as $request){
             $id=$request->getRequestId();$response=null;
@@ -52,11 +55,17 @@ final class Main extends PluginBase implements Listener{
                     $player->setUsingItem(false);$manager->setCurrentItemStackRequestId($id);
                     $manager->addTransactionPredictedSlotChanges($transaction);
                     $transaction->execute();
+                    foreach($transaction->getActions() as $action){
+                        if($action instanceof SlotChangeAction){
+                            $inventory=$action->getInventory();$slot=$action->getSlot();
+                            $changedSlots[spl_object_id($inventory)][$slot]=[$inventory,$slot];
+                        }
+                    }
                 }
                 // On old PM5 this method is the only response builder; it remains available on newer PM5.
                 $response=static fn()=>$executor->buildItemStackResponse();
             }catch(ItemStackRequestProcessException|TransactionException|PacketHandlingException $e){
-                $this->getLogger()->debug('Anvil request rejected: '.$e->getMessage());$manager->requestSyncAll();
+                $this->recordRejection($request,$e);$manager->requestSyncAll();
             }catch(\Throwable $e){
                 $this->getLogger()->logException($e);$manager->requestSyncAll();
             }finally{
@@ -66,5 +75,40 @@ final class Main extends PluginBase implements Listener{
         }
         // As in current PM5, report final slot contents after the complete packet batch.
         $session->sendDataPacket(ItemStackResponsePacket::create(array_map(static fn(\Closure $build)=>$build(),$responses)));
+        // A response contains counts, names and damage, but NOT enchantment NBT.
+        // Send the authoritative item after acknowledging the request. syncSlot
+        // preserves stack IDs (unlike syncContents), including batched request IDs.
+        foreach($changedSlots as $slots){
+            foreach($slots as [$inventory,$slot]){
+                if($manager->getItemStackInfo($inventory,$slot)!==null){
+                    $manager->syncSlot($inventory,$slot,$session->getTypeConverter()->coreItemStackToNet($inventory->getItem($slot)));
+                }
+            }
+        }
+    }
+
+    private function recordRejection(ItemStackRequest $request,\Throwable $error): void{
+        $this->getLogger()->debug('Anvil request rejected: '.$error->getMessage());
+        if(!AnvilRequestExecutor::isAnvilRequest($request) || time()-$this->lastRejectionLog<5){ return; }
+        $this->lastRejectionLog=time();$actions=[];
+        foreach($request->getActions() as $action){
+            $description=['type'=>(new \ReflectionClass($action))->getShortName()];
+            foreach(['getCount','getRecipeId','getFilterStringIndex'] as $method){
+                if(method_exists($action,$method)){ $description[$method]=$action->$method(); }
+            }
+            foreach(['getSource','getDestination'] as $method){
+                if(method_exists($action,$method)){
+                    $slot=$action->$method();
+                    $description[$method]=[method_exists($slot,'getContainerName') ? $slot->getContainerName()->getContainerId() : $slot->getContainerId(),$slot->getSlotId(),$slot->getStackId()];
+                }
+            }
+            $actions[]=$description;
+        }
+        $path=$this->getDataFolder().'anvil-errors.log';
+        clearstatcache(true,$path);
+        if(is_file($path) && filesize($path)>262144 && !@rename($path,$path.'.old')){ @file_put_contents($path,''); }
+        // No player names, rename strings or client item NBT are recorded.
+        @file_put_contents($path,json_encode(['time'=>gmdate('c'),'plugin'=>$this->getDescription()->getVersion(),'server'=>$this->getServer()->getVersion(),'request'=>$request->getRequestId(),'error'=>$error->getMessage(),'actions'=>$actions],JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL,FILE_APPEND|LOCK_EX);
+        $this->getLogger()->warning('Наковальня отклонила запрос: '.$error->getMessage().'. Подробности: plugins/AmyxAnvil/anvil-errors.log');
     }
 }

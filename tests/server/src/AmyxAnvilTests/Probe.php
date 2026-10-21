@@ -74,6 +74,23 @@ final class Probe extends PluginBase{
         $actions[]=new Take($output,self::slot(C::CREATED_OUTPUT,O::CREATED_ITEM_OUTPUT,0),self::slot(C::INVENTORY,0,$m->getItemStackInfo($p->getInventory(),0)->getStackId()));
         return new ItemStackRequest(-1,$actions,$name===null ? [] : [$name],0);
     }
+    private static function roundTrip(\pocketmine\network\mcpe\protocol\DataPacket $packet): \pocketmine\network\mcpe\protocol\DataPacket{
+        $old=class_exists(\pocketmine\network\mcpe\protocol\serializer\PacketSerializer::class);
+        $context=[];
+        if($old && (new \ReflectionMethod(\pocketmine\network\mcpe\protocol\serializer\PacketSerializer::class,'encoder'))->getNumberOfRequiredParameters()>0){
+            $context[] = new \pocketmine\network\mcpe\protocol\serializer\PacketSerializerContext(\pocketmine\network\mcpe\convert\TypeConverter::getInstance()->getItemTypeDictionary());
+        }
+        $out=$old ? \pocketmine\network\mcpe\protocol\serializer\PacketSerializer::encoder(...$context) : new \pmmp\encoding\ByteBufferWriter();
+        $packet->encode($out);$bytes=$old ? $out->getBuffer() : $out->getData();
+        $in=$old ? \pocketmine\network\mcpe\protocol\serializer\PacketSerializer::decoder($bytes,0,...$context) : new \pmmp\encoding\ByteBufferReader($bytes);
+        $class=$packet::class;$copy=new $class();$copy->decode($in);return $copy;
+    }
+    private static function lastResponse(SyntheticPlayer $p): ItemStackResponsePacket{
+        foreach(array_reverse($p->getNetworkSession()->sent) as $packet){
+            if($packet instanceof ItemStackResponsePacket){ return $packet; }
+        }
+        throw new \RuntimeException('No response');
+    }
     private function send(SyntheticPlayer $p,ItemStackRequest $request): int{
         $event=new DataPacketReceiveEvent($p->getNetworkSession(),ItemStackRequestPacket::create([$request]));$event->call();self::ok($event->isCancelled(),'Plugin did not intercept request');
         foreach(array_reverse($p->getNetworkSession()->sent) as $packet){
@@ -92,12 +109,69 @@ final class Probe extends PluginBase{
                 [$p,$w]=$this->fixture(I::DIAMOND()->setLore(['NBT']));self::ok($this->send($p,$this->request($p,$w,'Алмаз'))===ItemStackResponse::RESULT_OK);
                 self::ok($w->isSlotEmpty(0));self::ok($p->getInventory()->getItem(0)->getCustomName()==='Алмаз');self::ok($p->getInventory()->getItem(0)->getLore()===['NBT']);self::ok($p->getXpManager()->getXpLevel()===29);self::ok($p->getXpManager()->getXpProgress()===0.25);
             });
+            foreach(['rename','repair','enchant'] as $operation){
+                $this->test('server consumes ingredients without client Consume actions: '.$operation,function() use($operation): void{
+                    $type=EnchantmentIdMap::getInstance()->fromId(26);
+                    $input=$operation==='repair' ? I::IRON_SWORD()->setDamage(100) : I::DIAMOND_SWORD();
+                    $material=$operation==='repair' ? I::IRON_INGOT()->setCount(8) : ($operation==='enchant' ? Bootstrap::book()->addEnchantment(new EnchantmentInstance($type,1)) : null);
+                    [$p,$w]=$this->fixture($input,$material);$name=$operation==='rename' ? 'Без Consume' : null;
+                    $r=$this->request($p,$w,$name);$a=array_values(array_filter($r->getActions(),static fn($action)=>!$action instanceof Consume));
+                    self::ok($this->send($p,new ItemStackRequest(-1,$a,$r->getFilterStrings(),0))===ItemStackResponse::RESULT_OK);
+                    $result=$p->getInventory()->getItem(0);self::ok($w->isSlotEmpty(0));
+                    if($operation==='rename'){ self::ok($result->getCustomName()===$name && $p->getXpManager()->getXpLevel()===29); }
+                    elseif($operation==='repair'){ self::ok($result->getDamage()===0 && $w->getItem(1)->getCount()===6 && $p->getXpManager()->getXpLevel()===28); }
+                    else{ self::ok($result->getEnchantmentLevel($type)===1 && $w->isSlotEmpty(1) && $p->getXpManager()->getXpLevel()===28); }
+                });
+            }
+            $this->test('result can pass through cursor into inventory in the same request',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Курсор');$a=$r->getActions();
+                $a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::CURSOR,O::CURSOR,0));
+                $a[]=new Place(1,self::slot(C::CURSOR,O::CURSOR,-1),self::slot(C::INVENTORY,0,0));
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,['Курсор'],0))===ItemStackResponse::RESULT_OK);
+                self::ok($p->getCursorInventory()->isSlotEmpty(0) && $p->getInventory()->getItem(0)->getCustomName()==='Курсор');self::ok($w->isSlotEmpty(0) && $p->getXpManager()->getXpLevel()===29);
+            });
+            $this->test('markerless preview pickup is routed to anvil handler',function(): void{
+                [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(8));
+                $request=new ItemStackRequest(-1,[new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::INVENTORY,0,0))],[],0);
+                self::ok($this->send($p,$request)===ItemStackResponse::RESULT_OK);self::ok($w->isSlotEmpty(0) && $w->getItem(1)->getCount()===6);self::ok($p->getInventory()->getItem(0)->getDamage()===0 && $p->getXpManager()->getXpLevel()===28);
+            });
+            $this->test('book enchants reach client as complete serialized NBT and stack ID remains usable',function(): void{
+                $mending=EnchantmentIdMap::getInstance()->fromId(26);$unbreaking=EnchantmentIdMap::getInstance()->fromId(17);
+                $book=Bootstrap::book()->addEnchantment(new EnchantmentInstance($mending,1))->addEnchantment(new EnchantmentInstance($unbreaking,3));
+                [$p,$w]=$this->fixture(I::NETHERITE_CHESTPLATE()->setLore(['Сохранить']),$book);
+                $r=$this->request($p,$w,null,1);$a=$r->getActions();$a[0]=new Recipe(0,0);$a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::INVENTORY,0,0));
+                $incoming=self::roundTrip(ItemStackRequestPacket::create([new ItemStackRequest(-1,$a,[],0)]));
+                self::ok($this->send($p,$incoming->getRequests()[0])===ItemStackResponse::RESULT_OK);
+                $result=$p->getInventory()->getItem(0);self::ok($result->getEnchantmentLevel($mending)===1 && $result->getEnchantmentLevel($unbreaking)===3 && $result->getLore()===['Сохранить']);
+                $afterResponse=false;$sent=false;$manager=$p->getNetworkSession()->getInvManager();
+                foreach($p->getNetworkSession()->sent as $packet){
+                    if($packet instanceof ItemStackResponsePacket){ self::roundTrip($packet);$afterResponse=true;continue; }
+                    if($afterResponse && $packet instanceof \pocketmine\network\mcpe\protocol\InventorySlotPacket && $packet->windowId===0 && $packet->inventorySlot===0 && $packet->item->getStackId()!==0){
+                        $decoded=self::roundTrip($packet);$wireItem=$p->getNetworkSession()->getTypeConverter()->netItemStackToCore($decoded->item->getItemStack());
+                        self::ok($wireItem->equalsExact($result),'Client did not receive the enchanted result NBT');
+                        self::ok($decoded->item->getStackId()===$manager->getItemStackInfo($p->getInventory(),0)->getStackId());$sent=true;
+                    }
+                }
+                self::ok($sent,'No full item update after the response');
+                $next=new ItemStackRequest(-2,[new Place(1,self::slot(C::INVENTORY,0,-1),self::slot(C::INVENTORY,1,0))],[],0);
+                $executor=new \pocketmine\network\mcpe\handler\ItemStackRequestExecutor($p,$manager,$next);$transaction=$executor->generateInventoryTransaction();$transaction->execute();
+                self::ok($p->getInventory()->isSlotEmpty(0) && $p->getInventory()->getItem(1)->equalsExact($result));self::ok($w->isSlotEmpty(0) && $w->isSlotEmpty(1) && $p->getXpManager()->getXpLevel()===25);
+            });
+            $this->test('book output through cursor and inventory in a batched request remains usable',function(): void{
+                $type=EnchantmentIdMap::getInstance()->fromId(26);[$p,$w]=$this->fixture(I::DIAMOND_SWORD(),Bootstrap::book()->addEnchantment(new EnchantmentInstance($type,1)));
+                $r=$this->request($p,$w,null,1);$a=$r->getActions();$a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::CURSOR,O::CURSOR,0));
+                $normal=new ItemStackRequest(-2,[new Place(1,self::slot(C::CURSOR,O::CURSOR,-1),self::slot(C::INVENTORY,0,0))],[],0);
+                $event=new DataPacketReceiveEvent($p->getNetworkSession(),ItemStackRequestPacket::create([new ItemStackRequest(-1,$a,[],0),$normal]));$event->call();self::ok($event->isCancelled());
+                $response=self::lastResponse($p);self::ok(count($response->getResponses())===2);foreach($response->getResponses() as $r){ self::ok($r->getResult()===ItemStackResponse::RESULT_OK); }
+                self::ok($p->getInventory()->getItem(0)->getEnchantmentLevel($type)===1 && $p->getCursorInventory()->isSlotEmpty(0) && $w->isSlotEmpty(0) && $w->isSlotEmpty(1) && $p->getXpManager()->getXpLevel()===28);
+                $last=end($p->getNetworkSession()->sent);self::ok($last instanceof \pocketmine\network\mcpe\protocol\InventorySlotPacket && $last->inventorySlot===0 && $last->windowId===0,'Final destination must receive full item data');
+            });
             $this->test('Bedrock anvil result preview can be taken into the cursor',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Результат');$a=$r->getActions();
                 $a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::CURSOR,O::CURSOR,0));
                 self::ok($this->send($p,new ItemStackRequest(-1,$a,['Результат'],0))===ItemStackResponse::RESULT_OK,'ANVIL_RESULT_PREVIEW was rejected');
                 self::ok($p->getCursorInventory()->getItem(0)->getCustomName()==='Результат');self::ok($w->isSlotEmpty(0));self::ok($p->getXpManager()->getXpLevel()===29);
-                $packet=end($p->getNetworkSession()->sent);$cleared=false;
+                $packet=self::lastResponse($p);$cleared=false;
                 foreach($packet->getResponses()[0]->getContainerInfos() as $container){
                     $id=method_exists($container,'getContainerName') ? $container->getContainerName()->getContainerId() : $container->getContainerId();
                     if($id===C::ANVIL_RESULT_PREVIEW){
@@ -162,12 +236,12 @@ final class Probe extends PluginBase{
             $this->test('stack rename requires and produces the whole original count',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND()->setCount(64));self::ok($this->send($p,$this->request($p,$w,'Stack',0,64,false,64))===ItemStackResponse::RESULT_OK);self::ok($p->getInventory()->getItem(0)->getCount()===64);
             });
-            foreach(['insufficient XP','full destination','missing material consumption','forged extra output','partial input consumption','permission denied','spectator','removed anvil'] as $case){
+            foreach(['insufficient XP','full destination','incorrect material consumption','forged extra output','partial input consumption','permission denied','spectator','removed anvil'] as $case){
                 $this->test('reject '.$case.' without charging or moving items',function() use($case): void{
                     [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(8));$materials=2;$count=1;$input=1;
                     if($case==='insufficient XP'){ $p->getXpManager()->setXpAndProgressNoEvent(0,0.25); }
                     if($case==='full destination'){ $p->getInventory()->setItem(0,I::STICK()->setCount(64)); }
-                    if($case==='missing material consumption'){ $materials=0; }
+                    if($case==='incorrect material consumption'){ $materials=1; }
                     if($case==='forged extra output'){ $count=2; }
                     if($case==='partial input consumption'){ $input=0; }
                     if($case==='permission denied'){ $p->allowed=false; }
@@ -190,6 +264,10 @@ final class Probe extends PluginBase{
             $this->test('replaying a successful request cannot duplicate its result',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND());$request=$this->request($p,$w,'Once');self::ok($this->send($p,$request)===ItemStackResponse::RESULT_OK);self::ok($this->send($p,$request)===ItemStackResponse::RESULT_ERROR);self::ok($p->getInventory()->getItem(0)->getCount()===1);self::ok($p->getXpManager()->getXpLevel()===29);
             });
+            $this->test('explicit partial stack consumption cannot yield a complete renamed stack',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND()->setCount(64));$request=$this->request($p,$w,'Half',0,64,false,32);
+                self::ok($this->send($p,$request)===ItemStackResponse::RESULT_ERROR);self::ok($w->getItem(0)->getCount()===64 && $p->getInventory()->isSlotEmpty(0) && $p->getXpManager()->getXpLevel()===30);
+            });
             $this->test('forged native stack ID is rejected before item or XP changes',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Forged');$a=$r->getActions();
                 $inputSlot=is_array(O::ANVIL) ? array_search(0,O::ANVIL,true) : O::ANVIL;
@@ -205,7 +283,7 @@ final class Probe extends PluginBase{
                 [$p,$w]=$this->fixture(I::DIAMOND());$p->getInventory()->setItem(1,I::STICK()->setCount(5));$m=$p->getNetworkSession()->getInvManager();
                 $normal=new ItemStackRequest(-2,[new Take(2,self::slot(C::INVENTORY,1,$m->getItemStackInfo($p->getInventory(),1)->getStackId()),self::slot(C::INVENTORY,2,0))],[],0);
                 $event=new DataPacketReceiveEvent($p->getNetworkSession(),ItemStackRequestPacket::create([$this->request($p,$w,'Batch'),$normal]));$event->call();self::ok($event->isCancelled());
-                $response=end($p->getNetworkSession()->sent);self::ok($response instanceof ItemStackResponsePacket);self::ok(count($response->getResponses())===2);
+                $response=self::lastResponse($p);self::ok($response instanceof ItemStackResponsePacket);self::ok(count($response->getResponses())===2);
                 foreach($response->getResponses() as $r){ self::ok($r->getResult()===ItemStackResponse::RESULT_OK); }
                 self::ok($p->getInventory()->getItem(0)->getCustomName()==='Batch');self::ok($p->getInventory()->getItem(1)->getCount()===3);self::ok($p->getInventory()->getItem(2)->getCount()===2);
             });
