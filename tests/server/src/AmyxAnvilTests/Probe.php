@@ -26,6 +26,7 @@ use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\DeprecatedCraf
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\ItemStackRequest;
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\ItemStackRequestSlotInfo as Slot;
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\TakeStackRequestAction as Take;
+use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\PlaceStackRequestAction as Place;
 use pocketmine\network\mcpe\protocol\types\inventory\stackresponse\ItemStackResponse;
 use pocketmine\plugin\PluginBase;
 use pocketmine\scheduler\ClosureTask;
@@ -90,6 +91,58 @@ final class Probe extends PluginBase{
             $this->test('native packet rename consumes input, returns exact result and charges one level',function(): void{
                 [$p,$w]=$this->fixture(I::DIAMOND()->setLore(['NBT']));self::ok($this->send($p,$this->request($p,$w,'Алмаз'))===ItemStackResponse::RESULT_OK);
                 self::ok($w->isSlotEmpty(0));self::ok($p->getInventory()->getItem(0)->getCustomName()==='Алмаз');self::ok($p->getInventory()->getItem(0)->getLore()===['NBT']);self::ok($p->getXpManager()->getXpLevel()===29);self::ok($p->getXpManager()->getXpProgress()===0.25);
+            });
+            $this->test('Bedrock anvil result preview can be taken into the cursor',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Результат');$a=$r->getActions();
+                $a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::CURSOR,O::CURSOR,0));
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,['Результат'],0))===ItemStackResponse::RESULT_OK,'ANVIL_RESULT_PREVIEW was rejected');
+                self::ok($p->getCursorInventory()->getItem(0)->getCustomName()==='Результат');self::ok($w->isSlotEmpty(0));self::ok($p->getXpManager()->getXpLevel()===29);
+                $packet=end($p->getNetworkSession()->sent);$cleared=false;
+                foreach($packet->getResponses()[0]->getContainerInfos() as $container){
+                    $id=method_exists($container,'getContainerName') ? $container->getContainerName()->getContainerId() : $container->getContainerId();
+                    if($id===C::ANVIL_RESULT_PREVIEW){
+                        $slot=$container->getSlots()[0];$cleared=$slot->getSlot()===50 && $slot->getCount()===0 && $slot->getItemStackId()===0;
+                    }
+                }
+                self::ok($cleared,'Client was not told that the virtual result slot is empty');
+            });
+            $this->test('Bedrock anvil result preview can be shift-transferred after repair',function(): void{
+                [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(8));$r=$this->request($p,$w,null,2);$a=$r->getActions();
+                $a[count($a)-1]=new Place(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::INVENTORY,0,0));
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,[],0))===ItemStackResponse::RESULT_OK,'Preview Place was rejected');
+                self::ok($p->getInventory()->getItem(0)->getDamage()===0);self::ok($w->getItem(1)->getCount()===6);self::ok($p->getXpManager()->getXpLevel()===28);
+            });
+            $this->test('enchanted preview result can be collected and cannot be replayed',function(): void{
+                $type=EnchantmentIdMap::getInstance()->fromId(26);[$p,$w]=$this->fixture(I::DIAMOND_SWORD(),Bootstrap::book()->addEnchantment(new EnchantmentInstance($type,1)));
+                $r=$this->request($p,$w,null,1);$a=$r->getActions();$a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::INVENTORY,0,0));$request=new ItemStackRequest(-1,$a,[],0);
+                self::ok($this->send($p,$request)===ItemStackResponse::RESULT_OK);self::ok($this->send($p,$request)===ItemStackResponse::RESULT_ERROR);
+                self::ok($p->getInventory()->getItem(0)->getEnchantmentLevel($type)===1);self::ok($p->getInventory()->getItem(0)->getCount()===1);self::ok($w->isSlotEmpty(0) && $w->isSlotEmpty(1));self::ok($p->getXpManager()->getXpLevel()===28);
+            });
+            $this->test('legacy physical preview slot three uses the same calculated result',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Legacy preview',0,1,true);$a=$r->getActions();
+                $a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,3,0),self::slot(C::HOTBAR,0,0));
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,['Legacy preview'],0))===ItemStackResponse::RESULT_OK);self::ok($p->getInventory()->getItem(0)->getCustomName()==='Legacy preview');
+            });
+            $this->test('split result across preview and created aliases shares one finite output',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND()->setCount(64));$r=$this->request($p,$w,'Split',0,64,false,64);$a=$r->getActions();
+                $a[count($a)-1]=new Take(32,self::slot(C::ANVIL_RESULT_PREVIEW,50,0),self::slot(C::INVENTORY,0,0));
+                $a[]=new Place(32,self::slot(C::CREATED_OUTPUT,O::CREATED_ITEM_OUTPUT,0),self::slot(C::INVENTORY,1,0));
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,['Split'],0))===ItemStackResponse::RESULT_OK);
+                self::ok($p->getInventory()->getItem(0)->getCount()===32 && $p->getInventory()->getItem(1)->getCount()===32);self::ok($w->isSlotEmpty(0));self::ok($p->getXpManager()->getXpLevel()===29);
+            });
+            foreach([true,false] as $previewFirst){
+                $this->test('taking a second result through another alias is rejected '.($previewFirst ? 'preview first' : 'created first'),function() use($previewFirst): void{
+                    [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Duplicate');$a=$r->getActions();
+                    $first=$previewFirst ? C::ANVIL_RESULT_PREVIEW : C::CREATED_OUTPUT;$second=$previewFirst ? C::CREATED_OUTPUT : C::ANVIL_RESULT_PREVIEW;
+                    $a[count($a)-1]=new Take(1,self::slot($first,50,0),self::slot(C::INVENTORY,0,0));$a[]=new Take(1,self::slot($second,50,0),self::slot(C::INVENTORY,1,0));
+                    self::ok($this->send($p,new ItemStackRequest(-1,$a,['Duplicate'],0))===ItemStackResponse::RESULT_ERROR);
+                    self::ok($w->getItem(0)->getCount()===1);self::ok($p->getInventory()->getContents()===[]);self::ok($p->getXpManager()->getXpLevel()===30);
+                });
+            }
+            $this->test('unknown preview slot cannot create an output',function(): void{
+                [$p,$w]=$this->fixture(I::DIAMOND());$r=$this->request($p,$w,'Wrong slot');$a=$r->getActions();
+                $a[count($a)-1]=new Take(1,self::slot(C::ANVIL_RESULT_PREVIEW,49,0),self::slot(C::INVENTORY,0,0));
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,['Wrong slot'],0))===ItemStackResponse::RESULT_ERROR);self::ok($w->getItem(0)->getCount()===1);self::ok($p->getInventory()->isSlotEmpty(0));self::ok($p->getXpManager()->getXpLevel()===30);
             });
             $this->test('native packet repair consumes only needed material and costs levels',function(): void{
                 [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(8));self::ok($this->send($p,$this->request($p,$w,null,2))===ItemStackResponse::RESULT_OK);
