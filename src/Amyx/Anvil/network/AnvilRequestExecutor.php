@@ -42,7 +42,8 @@ final class AnvilRequestExecutor extends ItemStackRequestExecutor{
         $strings=$anvilRequest->getFilterStrings();$name=null;
         if($optional!==null){
             $index=$optional->getFilterStringIndex();
-            if($index>=0){
+            // Bedrock may leave index 0 even when there are no strings to filter.
+            if($index>=0 && $strings!==[]){
                 if(!array_key_exists($index,$strings)){ throw new ItemStackRequestProcessException('Invalid rename text index'); }
                 $name=$strings[$index];
             }

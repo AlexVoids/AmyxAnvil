@@ -95,6 +95,10 @@ final class Probe extends PluginBase{
                 [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(8));self::ok($this->send($p,$this->request($p,$w,null,2))===ItemStackResponse::RESULT_OK);
                 self::ok($p->getInventory()->getItem(0)->getDamage()===0);self::ok($w->getItem(1)->getCount()===6);self::ok($p->getXpManager()->getXpLevel()===28);
             });
+            $this->test('empty filter list with Bedrock default index zero still permits repair',function(): void{
+                [$p,$w]=$this->fixture(I::IRON_SWORD()->setDamage(100),I::IRON_INGOT()->setCount(2));$r=$this->request($p,$w,null,2);$a=$r->getActions();$a[0]=new Recipe(0,0);
+                self::ok($this->send($p,new ItemStackRequest(-1,$a,[],0))===ItemStackResponse::RESULT_OK);self::ok($p->getInventory()->getItem(0)->getDamage()===0);self::ok($p->getXpManager()->getXpLevel()===28);
+            });
             $this->test('native enchanted-book fusion changes NBT and costs two levels',function(): void{
                 $type=EnchantmentIdMap::getInstance()->fromId(26);[$p,$w]=$this->fixture(I::DIAMOND_SWORD(),Bootstrap::book()->addEnchantment(new EnchantmentInstance($type,1)));
                 self::ok($this->send($p,$this->request($p,$w,null,1))===ItemStackResponse::RESULT_OK);self::ok($p->getInventory()->getItem(0)->getEnchantmentLevel($type)===1);self::ok($p->getXpManager()->getXpLevel()===28);
