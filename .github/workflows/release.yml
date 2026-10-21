@@ -1,0 +1,37 @@
+name: Publish AmyxAnvil release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify release files
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version: //p' plugin.yml)
+          test "$RELEASE_TAG" = "v$version"
+          (cd build && sha256sum --check SHA256SUMS.txt)
+      - name: Publish checked artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            build/AmyxAnvil.phar build/AmyxAnvil-install.zip \
+            build/AmyxAnvil-source.zip build/SHA256SUMS.txt \
+            --verify-tag --draft --title "AmyxAnvil $RELEASE_TAG" \
+            --notes-file docs/RELEASE_NOTES.md
+          gh release edit "$RELEASE_TAG" --draft=false --latest

@@ -1,0 +1,3 @@
+5b59752bf1803dfdf70fc74695047a87b40834218a16981f517c1cea82841bb4  AmyxAnvil.phar
+c639ea86bead22954298e1a9adb1b2ce4faeb1b1b7f740ff4d502a087a2ff1bf  AmyxAnvil-install.zip
+a693f9c0583571e109d31637ce3788f6e2bac8f1fb9d2414fd03fc66a9a1e924  AmyxAnvil-source.zip

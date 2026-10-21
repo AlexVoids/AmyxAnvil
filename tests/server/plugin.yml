@@ -1,0 +1,5 @@
+name: AmyxAnvilTests
+main: AmyxAnvilTests\Probe
+version: 1.0.0
+api: 5.0.0
+depend: [AmyxAnvil]

@@ -1,0 +1,12 @@
+name: AmyxAnvil
+main: Amyx\Anvil\Main
+version: 1.0.0
+api: 5.0.0
+load: STARTUP
+author: AlexVoids
+description: Native Bedrock anvil transactions, repairs, names and enchantment merging
+website: https://github.com/AlexVoids/AmyxAnvil
+permissions:
+  amyxanvil.use:
+    default: true
+    description: Use physical anvils

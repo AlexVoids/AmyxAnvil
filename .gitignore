@@ -1,0 +1,11 @@
+/work/
+/.idea/
+/.vscode/
+/.phpunit.cache/
+/.DS_Store
+*.log
+*.tmp
+__pycache__/
+/.cache/
+/.env
+/.env.*
